@@ -1,0 +1,505 @@
+#!/usr/bin/env perl
+#
+# sendmail-brevo — drop-in replacement for /usr/sbin/sendmail that sends via Brevo (Sendinblue) API and logs payload
+#
+# Purpose
+#   Read a full RFC 5322 email message from STDIN (as sendmail would), parse headers and MIME body,
+#   extract sender/recipients/subject/body/attachments, build a JSON payload matching Brevo
+#   POST /v3/smtp/email, perform the actual HTTP call to Brevo, and append the payload (pretty-printed)
+#   to /var/log/brevo-sendmail.log alongside a commented curl command line and a short summary.
+#
+# Key features
+#   - RFC 2047 header decoding (UTF‑8 output) via Perl's Encode::decode('MIME-Header', ...)
+#   - Handles folded headers
+#   - MIME support: text/plain, text/html, multipart/alternative, multipart/mixed (nested)
+#   - Attachments decoded (base64 or quoted-printable) and re-encoded base64 for Brevo
+#   - CRLF normalization
+#   - Robust JSON generation via JSON::PP (core Perl)
+#
+# Dependencies (Ubuntu default / standard):
+#   - Perl (core modules: Encode, JSON::PP, MIME::Base64, MIME::QuotedPrint, POSIX)
+#   - No jq required (JSON built in Perl). If you wish to pretty-print externally: sudo apt-get install jq (optional).
+#
+# Installation guide (run as root):
+#   1) Save this file as /usr/local/bin/sendmail-brevo and make it executable:
+#        install -m 0755 -o root -g root sendmail-brevo /usr/local/bin/sendmail-brevo
+#      (If working from a repo, ensure the file is copied from usr/local/bin/sendmail-brevo to the absolute path.)
+#   2) Prepare log file and permissions:
+#        sudo touch /var/log/brevo-sendmail.log
+#        sudo chown root:adm /var/log/brevo-sendmail.log
+#        sudo chmod 0640 /var/log/brevo-sendmail.log
+#   - On SpinupWP server, you can use these permissions : 
+#        sudo chown sudo chown root:site-users /var/log/brevo-sendmail.log
+#        sudo chmod 660 /var/log/brevo-sendmail.log
+#   3) Backup current sendmail and point it to this script (choose one):
+#        sudo mv /usr/sbin/sendmail /usr/sbin/sendmail.msmtp-backup
+#        sudo ln -s /usr/local/bin/sendmail-brevo /usr/sbin/sendmail
+#    or adjust MTA configuration to invoke /usr/local/bin/sendmail-brevo as the sendmail command.
+#
+#      You can revert to your old setting with : 
+#      sudo rm /usr/sbin/sendmail
+#      sudo ln -s /usr/sbin/sendmail.msmtp-backup /usr/sbin/sendmail
+#
+#   4) API key setup:
+#        The Brevo API key is defined inside this script in the $API_KEY constant.
+#        Edit this file and set your real key in that variable before enabling real sends.
+#
+# Security note:
+#   - This script writes logs to /var/log/brevo-sendmail.log. Ensure it is readable by admins only (0640) and rotated.
+#   - For production, consider logrotate.d config to avoid large files.
+#
+# Usage (as sendmail):
+#   Typical MTAs or apps will pipe the raw email to this script. You can test manually:
+#       cat sample.eml | /usr/local/bin/sendmail-brevo -t
+#   Options are ignored; they are accepted for compatibility.
+
+use strict;
+use warnings;
+use Encode qw(decode encode);
+use JSON::PP;
+use MIME::Base64 qw(encode_base64 decode_base64);
+use MIME::QuotedPrint qw(decode_qp);
+use POSIX qw(strftime);
+use File::Temp qw(tempfile);
+
+# Constants
+my $LOG_FILE = '/var/log/brevo-sendmail.log';
+# Hardcoded Brevo API key (used for the real HTTP call)
+# IMPORTANT: Keep this file restricted. Replace the placeholder with your real key if not already set.
+my $API_KEY = 'xkeysib';
+# Debug flag: enable verbose debug logs when set to 1 (or export BREVO_DEBUG=1)
+my $DEBUG = $ENV{BREVO_DEBUG} ? 1 : 0;
+
+# Collect all stdin (raw email). Normalize CRLF to LF for parsing, but preserve decoded payloads.
+binmode(STDIN);
+binmode(STDOUT, ':utf8');
+binmode(STDERR, ':utf8');
+
+my $raw = do { local $/; <STDIN> // '' };
+# Normalize newlines to \n for easier parsing
+$raw =~ s/\r\n/\n/g;
+$raw =~ s/\r/\n/g;
+
+# Split headers and body at first blank line
+my ($raw_headers, $raw_body) = split(/\n\n/, $raw, 2);
+$raw_headers //= '';
+$raw_body    //= '';
+
+# Unfold headers: join continuation lines that start with SP/HT
+$raw_headers =~ s/\n([ \t]+)/$1/g;
+
+# Parse headers into a multimap (preserve case-insensitive nature)
+my %headers;
+for my $line (split(/\n/, $raw_headers)) {
+    next if $line =~ /^\s*$/;
+    if ($line =~ /^([^:]+):\s*(.*)$/) {
+        my ($name, $value) = ($1, $2);
+        my $lc = lc $name;
+        push @{ $headers{$lc} }, $value;
+    }
+}
+
+# Helper: decode RFC 2047 MIME encoded-words to UTF-8
+sub decode_mime_header {
+    my ($s) = @_;
+    return '' unless defined $s;
+    # Encode's MIME-Header can decode RFC 2047 words
+    my $decoded = eval { decode('MIME-Header', $s) };
+    $decoded = $s if $@ || !defined $decoded;
+    # Ensure proper utf8 flag
+    $decoded = Encode::decode('UTF-8', Encode::encode('UTF-8', $decoded)) unless Encode::is_utf8($decoded);
+    return $decoded;
+}
+
+# Helper: parse address list into array of {email, name?}
+sub parse_addresses {
+    my ($values) = @_;
+    my @out;
+    return \@out unless $values && @$values;
+
+    # Join multiple header instances with commas, then split by commas not inside quotes/angles
+    my $joined = join(', ', @$values);
+    $joined = decode_mime_header($joined);
+
+    # Tokenize addresses respecting quotes and angle brackets
+    my @parts;
+    {
+        my $buf = '';
+        my $in_quotes = 0;
+        my $angle = 0;
+        my @chars = split(//, $joined);
+        for my $ch (@chars) {
+            if ($ch eq '"') { $in_quotes = !$in_quotes; $buf .= $ch; next; }
+            if (!$in_quotes) {
+                if ($ch eq '<') { $angle++; $buf .= $ch; next; }
+                if ($ch eq '>') { $angle-- if $angle>0; $buf .= $ch; next; }
+                if ($ch eq ',' && $angle==0) { push @parts, $buf; $buf = ''; next; }
+            }
+            $buf .= $ch;
+        }
+        push @parts, $buf if length $buf;
+    }
+
+    for my $p (@parts) {
+        $p =~ s/^\s+|\s+$//g;
+        next unless length $p;
+        my ($name, $email);
+        if ($p =~ /<(.*?)>/) {
+            $email = $1;
+            ($name = $p) =~ s/<.*?>//g;
+            $name =~ s/^\s+|\s+$//g;
+            $name =~ s/^"|"$//g;
+        } else {
+            # Could be just an email or a name-only
+            if ($p =~ /\S\@\S/) { $email = $p; } else { $name = $p; }
+        }
+        # Cleanup email
+        if (defined $email) {
+            $email =~ s/^\s+|\s+$//g;
+            $email =~ s/^mailto://i;
+        }
+        # If missing email but name looks like email, swap
+        if (!defined $email && defined $name && $name =~ /\S\@\S/) {
+            $email = $name; undef $name;
+        }
+        next unless defined $email && $email ne '';
+        my %entry = ( email => $email );
+        $entry{name} = $name if defined $name && $name ne '';
+        push @out, \%entry;
+    }
+    return \@out;
+}
+
+# Extract key headers
+my $from_raw = $headers{'from'} && $headers{'from'}->[0] // '';
+my $to_list  = parse_addresses($headers{'to'});
+my $cc_list  = parse_addresses($headers{'cc'});
+my $bcc_list = parse_addresses($headers{'bcc'});
+
+my $subject = decode_mime_header( ($headers{'subject'} && $headers{'subject'}->[0]) // '' );
+
+# Parse From into sender {email,name}
+my $from_addrs = parse_addresses( [$from_raw] );
+my $sender = { email => 'unknown@example.com' };
+if ($from_addrs && @$from_addrs) { $sender = $from_addrs->[0]; }
+
+# MIME parsing utilities
+sub parse_content_type {
+    my ($v) = @_;
+    $v //= '';
+    my ($type, %params);
+    if ($v =~ m{^\s*([^;]+)\s*(?:;\s*(.*))?$}i) {
+        $type = lc $1; my $rest = $2 // '';
+        # Ensure the first parameter is parsable by prefixing a semicolon if needed
+        $rest = ';' . $rest if length $rest;
+        while ($rest =~ /\s*;\s*([^=\s]+)\s*=\s*(?:"([^"]*)"|([^;\s]*))/g) {
+            my ($k, $v1, $v2) = ($1, $2, $3);
+            $params{lc $k} = defined $v1 ? $v1 : $v2;
+        }
+    }
+    return ($type // 'text/plain', \%params);
+}
+
+sub parse_content_disp_filename {
+    my ($v) = @_;
+    return undef unless defined $v && length $v;
+    my $filename;
+    # RFC 5987/2231 filename*
+    if ($v =~ /filename\*(?:0\*?)?=([^']*)'[^']*'([^;]+)/i) {
+        my ($charset, $encval) = ($1, $2);
+        $encval =~ s/\s+$//;
+        $encval =~ s/\r|\n//g;
+        $encval =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg;
+        $filename = eval { decode($charset, $encval) } || $encval;
+    }
+    # filename="..."
+    if (!$filename && $v =~ /filename\s*=\s*"([^"]+)"/i) {
+        $filename = $1;
+    }
+    # filename=bare
+    if (!$filename && $v =~ /filename\s*=\s*([^;\s]+)/i) {
+        $filename = $1;
+    }
+    $filename = decode_mime_header($filename) if defined $filename;
+    return $filename;
+}
+
+# Split a multipart body by boundary, returning arrayref of parts, each as { headers => {..}, body => '...' }
+sub split_multipart {
+    my ($body, $boundary) = @_;
+    return [] unless defined $body && defined $boundary && length $boundary;
+    my @lines = split(/\n/, $body, -1);
+    my $delim_re = qr/^\s*--\Q$boundary\E\s*$/;
+    my $close_re = qr/^\s*--\Q$boundary\E--\s*$/;
+    my @parts; my $in = 0; my @buf;
+    for my $line (@lines) {
+        # normalize any stray \r (already mostly removed globally)
+        $line =~ s/\r$//;
+        if (!$in) {
+            if ($line =~ $delim_re) { $in = 1; @buf = (); }
+            next;
+        }
+        if ($line =~ $delim_re || $line =~ $close_re) {
+            my $part_raw = join("\n", @buf);
+            my ($ph, $pb) = split(/\n\n/, $part_raw, 2);
+            $ph //= ''; $pb //= '';
+            $ph =~ s/\n([ \t]+)/$1/g; # unfold
+            # parse part headers
+            my %phmap;
+            for my $l (split(/\n/, $ph)) {
+                next if $l =~ /^\s*$/;
+                if ($l =~ /^([^:]+):\s*(.*)$/) {
+                    my ($n,$val) = ($1,$2);
+                    push @{ $phmap{lc $n} }, $val;
+                }
+            }
+            push @parts, { headers => \%phmap, body => $pb };
+            last if $line =~ $close_re;
+            @buf = (); next;
+        }
+        push @buf, $line;
+    }
+    return \@parts;
+}
+
+# Recursively process a body part; collect html/text and attachments
+sub process_part {
+    my ($headers_ref, $body, $out) = @_;
+
+    my $ctype = ($headers_ref->{'content-type'} && $headers_ref->{'content-type'}->[0]) // 'text/plain; charset=UTF-8';
+    my ($type, $params) = parse_content_type($ctype);
+    my $cte = lc( ($headers_ref->{'content-transfer-encoding'} && $headers_ref->{'content-transfer-encoding'}->[0]) // '' );
+    my $disp = ($headers_ref->{'content-disposition'} && $headers_ref->{'content-disposition'}->[0]) // '';
+
+    my $filename = parse_content_disp_filename($disp);
+    if (!$filename && $params->{name}) { $filename = decode_mime_header($params->{name}); }
+
+    # If multipart, do not decode transfer-encoding before boundary splitting
+    if ($type =~ m{^multipart/}) {
+        my $boundary = $params->{boundary} // '';
+        my $parts = split_multipart($body // '', $boundary);
+        for my $p (@$parts) {
+            process_part($p->{headers}, $p->{body}, $out);
+        }
+        return;
+    }
+
+    # Decode body according to transfer encoding for non-multipart leaf parts
+    my $decoded = $body // '';
+    $decoded =~ s/\r//g; # ensure LF only if any linger
+    if ($cte eq 'base64') {
+        # Remove non-base64 whitespace
+        my $b = $decoded; $b =~ s/\s+//g;
+        $decoded = eval { decode_base64($b) } // '';
+    } elsif ($cte eq 'quoted-printable') {
+        $decoded = decode_qp($decoded);
+    } else {
+        # 7bit/8bit/binary: leave as is
+    }
+
+    if ($filename || ($disp =~ /attachment/i)) {
+        # Treat as attachment
+        my $name = $filename // 'attachment.bin';
+        my $b64 = encode_base64($decoded, ''); # no newlines
+        push @{ $out->{attachments} }, { name => $name, content => $b64 };
+        return;
+    }
+
+    if ($type =~ m{^text/html\b}i) {
+        # Prefer first html if none set yet
+        if (!defined $out->{html}) {
+            my $charset = $params->{charset} // 'UTF-8';
+            my $html = eval { decode($charset, $decoded) } // $decoded;
+            $out->{html} = $html;
+        }
+        return;
+    }
+
+    if ($type =~ m{^text/plain\b}i) {
+        if (!defined $out->{text}) {
+            my $charset = $params->{charset} // 'UTF-8';
+            my $txt = eval { decode($charset, $decoded) } // $decoded;
+            $out->{text} = $txt;
+        }
+        return;
+    }
+
+    # Inline images or other inline parts without filename: could be ignored for now.
+}
+
+# Kick off processing for the top-level entity
+my ($top_type, $top_params) = parse_content_type( ($headers{'content-type'} && $headers{'content-type'}->[0]) // 'text/plain; charset=UTF-8' );
+my %collected = ( html => undef, text => undef, attachments => [] );
+if ($top_type =~ m{^multipart/}) {
+    my $parts = split_multipart($raw_body, $top_params->{boundary} // '');
+    for my $p (@$parts) {
+        process_part($p->{headers}, $p->{body}, \%collected);
+    }
+} else {
+    # Single-part message
+    my %hcopy = ( 'content-type' => $headers{'content-type'}, 'content-transfer-encoding' => $headers{'content-transfer-encoding'}, 'content-disposition' => $headers{'content-disposition'} );
+    process_part(\%hcopy, $raw_body, \%collected);
+}
+
+# Determine HTML content. Prefer HTML, but if it's effectively empty, fall back to text->HTML.
+my $htmlContent;
+my $htmlCandidate = $collected{html};
+if (defined $htmlCandidate) {
+    # Consider HTML empty if, after removing comments/tags and whitespace, nothing remains
+    my $tmp = $htmlCandidate;
+    $tmp =~ s/<!--.*?-->//sg;
+    $tmp =~ s/<[^>]*>//g;
+    $tmp =~ s/\s+//g;
+    undef $htmlCandidate if length($tmp) == 0;
+}
+if (defined $htmlCandidate) {
+    $htmlContent = $htmlCandidate;
+} else {
+    my $txt = $collected{text} // '';
+    # Escape HTML special chars (pre-wrap preserves newlines; do NOT insert <br> to avoid double spacing)
+    $txt =~ s/&/&amp;/g; $txt =~ s/</&lt;/g; $txt =~ s/>/&gt;/g;
+    # Preserve newlines as-is inside <pre> with white-space:pre-wrap
+    $htmlContent = "<html><body><pre style=\"font-family:inherit; white-space:pre-wrap; margin:0;\">$txt</pre></body></html>";
+}
+
+# Build Brevo JSON structure
+my %payload = (
+    sender  => { email => $sender->{email} },
+    to      => $to_list,
+    subject => $subject,
+    htmlContent => $htmlContent,
+);
+$payload{sender}{name} = $sender->{name} if defined $sender->{name};
+$payload{cc} = $cc_list if $cc_list && @$cc_list;
+$payload{bcc} = $bcc_list if $bcc_list && @$bcc_list;
+$payload{attachment} = $collected{attachments} if $collected{attachments} && @{$collected{attachments}};
+
+# Ensure arrays are defined (Brevo requires at least one recipient). If empty, keep empty list to reveal issue.
+$payload{to}  //= [];
+$payload{cc}  //= [] if exists $payload{cc};
+$payload{bcc} //= [] if exists $payload{bcc};
+
+# Prepare JSON string: pretty for logs (no ->utf8; rely on FH encoding) and compact for HTTP body (->utf8 bytes)
+my $json        = JSON::PP->new->canonical(0)->pretty(1)->encode(\%payload);
+my $json_compact = JSON::PP->new->utf8->canonical(0)->encode(\%payload);
+
+# Compose curl command (commented)
+my $curl = join(" \\\n", (
+    '# curl -s -X POST "https://api.brevo.com/v3/smtp/email"',
+    "#   -H \"accept: application/json\" -H \"api-key: $API_KEY\" -H \"content-type: application/json\"",
+    q{#   -d '},
+));
+my $curl_end = "# '";
+
+# Summary line
+my $to_summary  = join(', ', map { $_->{email} } @{$payload{to} // []});
+my $att_count   = scalar(@{ $payload{attachment} // [] });
+my $timestamp   = strftime('%Y-%m-%d %H:%M:%S%z', localtime());
+my $summary = sprintf("[%s] From=%s To=%s Subject=%s Attachments=%d\n",
+    $timestamp,
+    $payload{sender}{email} . (defined $payload{sender}{name} ? " (".$payload{sender}{name}.")" : ''),
+    $to_summary,
+    $subject,
+    $att_count,
+);
+
+# Write log output
+sub safe_append_log {
+    my ($path, $content) = @_;
+    eval {
+        open my $fh, '>>:encoding(UTF-8)', $path or die $!;
+        print {$fh} $content;
+        close $fh;
+        1;
+    } or do {
+        my $err = $@ || $!;
+        warn "Failed to write log $path: $err\n";
+    };
+}
+
+# Minimal logging helper: writes a single line with date, from, to, subject and status
+sub write_min_log {
+    my ($status) = @_;
+    my $ts = strftime('%Y-%m-%d %H:%M:%S%z', localtime());
+    my $from_email = ($payload{sender} && $payload{sender}{email}) // '';
+    my $to_emails = join(', ', map { $_->{email} } @{ $payload{to} // [] });
+    my $subj = $subject // '';
+    my $line = sprintf("[%s] From=%s To=%s Subject=%s Status=%s\n", $ts, $from_email, $to_emails, $subj, ($status // ''));
+    safe_append_log($LOG_FILE, $line);
+}
+
+if ($DEBUG) {
+    my $log_block = "==== brevo-sendmail ===========================================\n"
+                  . $summary
+                  . "---- RAW (stdin) -------------------------------------------\n"
+                  . $raw . "\n"
+                  . "---- JSON ---------------------------------------------------\n"
+                  . $json
+                  . "---- CURL (commented) --------------------------------------\n"
+                  . $curl . $json . "\n" . $curl_end . "\n"
+                  . "==============================================================\n\n";
+
+    safe_append_log($LOG_FILE, $log_block);
+}
+
+# Skip real send if no recipients (cron or maintenance invocation without an actual email)
+my $has_any_recipient = ((@{ $payload{to} // [] } + @{ $payload{cc} // [] } + @{ $payload{bcc} // [] }) > 0);
+if (!$has_any_recipient) {
+    write_min_log('SKIPPED-NO-RECIPIENTS');
+    if ($DEBUG) { safe_append_log($LOG_FILE, "NOTE: No recipients detected (to/cc/bcc empty); skipping Brevo request.\n\n"); }
+    exit 0;
+}
+
+# Perform the actual HTTP call via curl, unless API key is not configured
+if (!defined $API_KEY || $API_KEY =~ /YOUR_BREVO_API_KEY_HERE/i) {
+    write_min_log('SKIPPED-NO-APIKEY');
+    if ($DEBUG) { safe_append_log($LOG_FILE, "NOTE: API key not configured; skipping real send.\n\n"); }
+    exit 0;
+}
+
+# Write compact JSON to a temporary file to avoid shell quoting issues
+my ($tfh, $tpath) = tempfile('brevo-sendmail-XXXX', DIR => '/tmp', UNLINK => 1);
+binmode($tfh, ':raw');
+print $tfh $json_compact;
+close $tfh;
+
+# Build and execute curl command (redact API key in logs)
+my $curl_cmd = sprintf(
+    'curl -sS -m 20 --fail-with-body -X POST "https://api.brevo.com/v3/smtp/email" '
+    . '-H "accept: application/json" -H "api-key: %s" -H "content-type: application/json" '
+    . '--data-binary @%s -w " HTTPSTATUS:%{http_code}" 2>&1',
+    $API_KEY, $tpath
+);
+my $curl_output = `$curl_cmd`;
+my $curl_exit   = $? >> 8;
+
+# Extract HTTP status code from output
+my $http_status = 'UNKNOWN';
+if ($curl_output =~ s/ HTTPSTATUS:(\d{3})\s*\z//) {
+    $http_status = $1;
+}
+
+my $redacted_cmd = $curl_cmd;
+$redacted_cmd =~ s/(api-key: )[^"']+/${1}[REDACTED]/i;
+
+if ($DEBUG) {
+    my $resp_block = "---- CURL (executed) ----------------------------------------\n"
+                   . "Command: $redacted_cmd\n"
+                   . "Exit: $curl_exit\n"
+                   . "HTTP: $http_status\n"
+                   . "Output (sans status marker):\n$curl_output\n"
+                   . "==============================================================\n\n";
+
+    safe_append_log($LOG_FILE, $resp_block);
+}
+
+# Minimal log line with HTTP status
+write_min_log($http_status);
+
+# Exit status: 0 on success; 75 (EX_TEMPFAIL) on failure so callers may retry
+if ($curl_exit == 0) {
+    exit 0;
+} else {
+    print STDERR "brevo-sendmail: failed to send (curl exit $curl_exit). See $LOG_FILE for details.\n";
+    exit 75;
+}
