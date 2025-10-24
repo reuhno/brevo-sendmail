@@ -25,21 +25,13 @@
 #        install -m 0755 -o root -g root sendmail-brevo /usr/local/bin/sendmail-brevo
 #      (If working from a repo, ensure the file is copied from usr/local/bin/sendmail-brevo to the absolute path.)
 #   2) Prepare log file and permissions:
-#        sudo touch /var/log/brevo-sendmail.log
-#        sudo chown root:adm /var/log/brevo-sendmail.log
-#        sudo chmod 0640 /var/log/brevo-sendmail.log
-#   - On SpinupWP server, you can use these permissions : 
-#        sudo chown sudo chown root:site-users /var/log/brevo-sendmail.log
-#        sudo chmod 660 /var/log/brevo-sendmail.log
+#        touch /var/log/brevo-sendmail.log
+#        chown root:adm /var/log/brevo-sendmail.log
+#        chmod 0640 /var/log/brevo-sendmail.log
 #   3) Backup current sendmail and point it to this script (choose one):
-#        sudo mv /usr/sbin/sendmail /usr/sbin/sendmail.msmtp-backup
-#        sudo ln -s /usr/local/bin/sendmail-brevo /usr/sbin/sendmail
-#    or adjust MTA configuration to invoke /usr/local/bin/sendmail-brevo as the sendmail command.
-#
-#      You can revert to your old setting with : 
-#      sudo rm /usr/sbin/sendmail
-#      sudo ln -s /usr/sbin/sendmail.msmtp-backup /usr/sbin/sendmail
-#
+#        mv /usr/sbin/sendmail /usr/sbin/sendmail.orig
+#        ln -s /usr/local/bin/sendmail-brevo /usr/sbin/sendmail
+#      or adjust MTA configuration to invoke /usr/local/bin/sendmail-brevo as the sendmail command.
 #   4) API key setup:
 #        The Brevo API key is defined inside this script in the $API_KEY constant.
 #        Edit this file and set your real key in that variable before enabling real sends.
@@ -175,6 +167,12 @@ my $from_raw = $headers{'from'} && $headers{'from'}->[0] // '';
 my $to_list  = parse_addresses($headers{'to'});
 my $cc_list  = parse_addresses($headers{'cc'});
 my $bcc_list = parse_addresses($headers{'bcc'});
+my $reply_to_list = parse_addresses($headers{'reply-to'});
+my $reply_to = undef;
+if ($reply_to_list && @$reply_to_list) {
+    # Brevo expects a single replyTo object; pick the first address
+    $reply_to = $reply_to_list->[0];
+}
 
 my $subject = decode_mime_header( ($headers{'subject'} && $headers{'subject'}->[0]) // '' );
 
@@ -372,6 +370,8 @@ my %payload = (
 $payload{sender}{name} = $sender->{name} if defined $sender->{name};
 $payload{cc} = $cc_list if $cc_list && @$cc_list;
 $payload{bcc} = $bcc_list if $bcc_list && @$bcc_list;
+$payload{replyTo} = { email => $reply_to->{email} } if $reply_to && $reply_to->{email};
+$payload{replyTo}{name} = $reply_to->{name} if $reply_to && $reply_to->{name};
 $payload{attachment} = $collected{attachments} if $collected{attachments} && @{$collected{attachments}};
 
 # Ensure arrays are defined (Brevo requires at least one recipient). If empty, keep empty list to reveal issue.
@@ -445,8 +445,14 @@ if ($DEBUG) {
 # Skip real send if no recipients (cron or maintenance invocation without an actual email)
 my $has_any_recipient = ((@{ $payload{to} // [] } + @{ $payload{cc} // [] } + @{ $payload{bcc} // [] }) > 0);
 if (!$has_any_recipient) {
-    write_min_log('SKIPPED-NO-RECIPIENTS');
-    if ($DEBUG) { safe_append_log($LOG_FILE, "NOTE: No recipients detected (to/cc/bcc empty); skipping Brevo request.\n\n"); }
+    # Option 2: Ne logger que si ce n'est pas un message de cron
+    my $is_cron_message = ($subject =~ /^Cron\s+</i || $from_raw =~ /cron/i);
+    unless ($is_cron_message) {
+        write_min_log('SKIPPED-NO-RECIPIENTS');
+    }
+    if ($DEBUG && !$is_cron_message) { 
+        safe_append_log($LOG_FILE, "NOTE: No recipients detected (to/cc/bcc empty); skipping Brevo request.\n\n"); 
+    }
     exit 0;
 }
 
